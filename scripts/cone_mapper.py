@@ -21,6 +21,10 @@ Diagnostics (env vars):
   CONE_MEM_CEILING=80 — memory footprint ceiling as % of physical RAM (default: 80)
   CONE_SWAP_GROWTH_GB=2 — stop if system swap grows by more than this (default: 2)
 
+Paths (env vars, used by the validation runner):
+  CONE_CONFIG  — config JSON (default: data/sutherland/comparator.json)
+  CONE_OUT_DIR — output directory (default: results/cone/)
+
 Exit code 3 means the run stopped at a memory guard (partial results written).
 """
 import sys
@@ -273,8 +277,14 @@ def _nbytes(ref_counts):
     return len(ref_counts) * ref_counts.itemsize
 
 
+def _out_dir():
+    """results/cone/, or CONE_OUT_DIR (test runs must not touch real results)."""
+    return (os.environ.get("CONE_OUT_DIR")
+            or os.path.join(PROJECT_DIR, "results", "cone"))
+
+
 def _pass1_cache_paths():
-    cache_dir = os.path.join(PROJECT_DIR, "results", "cone")
+    cache_dir = _out_dir()
     return (os.path.join(cache_dir, "pass1-cache.meta.json"),
             os.path.join(cache_dir, "pass1-cache.bin"))
 
@@ -348,7 +358,8 @@ def _load_pass1_cache(path, err):
 
 
 def load_config():
-    path = os.path.join(PROJECT_DIR, "data", "sutherland", "comparator.json")
+    path = (os.environ.get("CONE_CONFIG")
+            or os.path.join(PROJECT_DIR, "data", "sutherland", "comparator.json"))
     with open(path) as f:
         return json.load(f)
 
@@ -420,7 +431,7 @@ def main(input_path=None):
     diag_last_write_time = 0.0
     diag_checkpoints = []
 
-    milestone_dir = os.path.join(PROJECT_DIR, "results", "cone")
+    milestone_dir = _out_dir()
     os.makedirs(milestone_dir, exist_ok=True)
     milestone_path = os.path.join(milestone_dir, "milestones.jsonl")
     milestone_fh = open(milestone_path, "a")
@@ -518,6 +529,14 @@ def main(input_path=None):
         def ensure_slot(idx):
             while len(const_refs) <= idx:
                 const_refs.append(None)
+
+    def suspect_full_names(sname):
+        """Declared names equal to sname or ending in "." + sname.
+        Config suspect names are short ("anyGeometry"); the export uses full
+        names ("GlobalTheory.Mem.Top.Bl.anyGeometry"). Same rule as
+        vacuity-check.py."""
+        suffix = "." + sname
+        return {n for n in decls if n == sname or n.endswith(suffix)}
 
     # --- Diagnostic helpers ---
 
@@ -636,7 +655,7 @@ def main(input_path=None):
         return rss, swap
 
     def dump_partial(reason):
-        out_dir = os.path.join(PROJECT_DIR, "results", "cone")
+        out_dir = _out_dir()
         os.makedirs(out_dir, exist_ok=True)
         partial_path = os.path.join(out_dir, "cone-partial.json")
         deps_path = os.path.join(out_dir, "cone-partial-deps.jsonl")
@@ -670,10 +689,11 @@ def main(input_path=None):
         suspects_found = {}
         if suspect_names:
             for sname in sorted(suspect_names):
-                referencing = [d for d, refs in deps.items()
-                               if sname in refs]
-                if referencing:
-                    suspects_found[sname] = len(referencing)
+                for fname in sorted(suspect_full_names(sname)):
+                    referencing = [d for d, refs in deps.items()
+                                   if fname in refs]
+                    if referencing:
+                        suspects_found[fname] = len(referencing)
             if suspects_found:
                 err(f"  Suspects in partial deps: {suspects_found}")
             else:
@@ -706,7 +726,7 @@ def main(input_path=None):
             err(f"Failed to write partial results: {e}")
 
     def write_diagnostics(exit_reason):
-        out_dir = os.path.join(PROJECT_DIR, "results", "cone")
+        out_dir = _out_dir()
         os.makedirs(out_dir, exist_ok=True)
         diag_path = os.path.join(out_dir, "diagnostics.json")
 
@@ -1016,17 +1036,25 @@ def main(input_path=None):
     # --- Suspect-name check ---
     suspects_in_cone = {}
     suspects_in_deps = {}
+    suspects_not_declared = []
     if suspect_names:
         for sname in sorted(suspect_names):
-            in_cones = [t for t, c in cones.items() if sname in c]
-            if in_cones:
-                suspects_in_cone[sname] = in_cones
-                err(f"  *** SUSPECT {sname} in cone of: "
-                    f"{', '.join(in_cones)}")
-            referencing = [d for d, refs in deps.items()
-                           if sname in refs]
-            if referencing:
-                suspects_in_deps[sname] = referencing
+            full = suspect_full_names(sname)
+            if not full:
+                suspects_not_declared.append(sname)
+            for fname in sorted(full):
+                in_cones = [t for t, c in cones.items() if fname in c]
+                if in_cones:
+                    suspects_in_cone[fname] = in_cones
+                    err(f"  *** SUSPECT {fname} in cone of: "
+                        f"{', '.join(in_cones)}")
+                referencing = [d for d, refs in deps.items()
+                               if fname in refs]
+                if referencing:
+                    suspects_in_deps[fname] = referencing
+        if suspects_not_declared:
+            err(f"WARNING: suspect names not declared in this export: "
+                f"{suspects_not_declared}")
         if not suspects_in_cone:
             err(f"\nSuspect names absent from all cones: "
                 f"{sorted(suspect_names)}")
@@ -1048,7 +1076,7 @@ def main(input_path=None):
     if any(inter_deps.values()):
         err(f"Inter-theorem deps: {inter_deps}")
 
-    out_dir = os.path.join(PROJECT_DIR, "results", "cone")
+    out_dir = _out_dir()
     os.makedirs(out_dir, exist_ok=True)
 
     result = {
@@ -1062,6 +1090,7 @@ def main(input_path=None):
         "axioms_in_cone": sorted(axioms_in_cone),
         "unexpected_axioms": sorted(unexpected),
         "suspects_in_cone": suspects_in_cone,
+        "suspects_not_declared": suspects_not_declared,
         "suspects_in_deps": {k: sorted(v)
                              for k, v in suspects_in_deps.items()},
         "cone_overlap": cone_overlap,

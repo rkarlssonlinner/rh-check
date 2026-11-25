@@ -27,3 +27,6 @@ results/bak/
 
 # Logs
 provenance/download-verify.log
+
+# Lean build output for validation cases
+scripts/test-cases/lean/.lake/

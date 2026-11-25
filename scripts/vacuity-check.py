@@ -12,9 +12,10 @@ Why this matters:
                    a trivially-true intermediate. Architecturally suspicious,
                    not mathematically vacuous.
 
-Sutherland's comparator output (explicit-statements.out) already shows zero
-references to anyGeometry in the statement types' transitive dependency cones.
-This script confirms that directly from the NDJSON export.
+Sutherland's auxiliary data (explicit-statements.out, robin-deps.txt,
+lagarias-deps.txt) shows no anyGeometry in the dependency cones of the Robin
+and Lagarias criterion statements. This script checks the five main theorems
+directly from the NDJSON export.
 
 Usage:
   source .venv/bin/activate
@@ -174,7 +175,7 @@ def check_expr_for_suspects(expr_idx):
     return bits_to_names(bits) if bits else set()
 
 
-PARTIAL_PATH = os.path.join(
+PARTIAL_PATH = os.environ.get("VACUITY_PARTIAL_PATH") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "results", "vacuity-partial.json",
 )

@@ -11,6 +11,8 @@ Streams the NDJSON kernel export through two checks:
 
 The scanner works directly on the export data and does not require a Lean installation, compilation, or execution of proof code. It serves as an intermediate check between reading the vacuity claims and re-running the full Lean type checker. Limitations are discussed below.
 
+The export was built with Lean 4.33.1, before some known soundness bugs were patched. Sutherland's re-check on a patched kernel (v4.36.0) already covers every known bug; this scan is an independent second look at the export itself. The detectors flag what a whole family of exploits needs (for example, any huge number for the GMP overflow family), so a variant of a known family would likely show up too. A new kind of bug would not: that needs a re-check with an independent kernel.
+
 ## Source
 
 Andrew Sutherland's independent sandboxed rebuild at `math.mit.edu/~drew/grh/`. SHA-256 hashes match across three independent builds (Sutherland, Zeng, ours).
@@ -141,18 +143,18 @@ Full scan of all 1,468,418 declarations in the export. Results below use a green
 
 **Exploit scan:**
 
-- Unverified (re-run pending): zero `suspicious` flags across the entire export. Two detectors that raise `suspicious` flags had gaps: D4 could not read numbers at all, and D7 skipped free variables inside projections and `mdata`.
+- Green: zero `suspicious` flags across the entire export. Re-run 2026-11-25 with the fixed parser (numbers read from their text form, projections followed); it skipped no subtrees and failed to read no literals.
 - Green: zero unsafe or partial declarations — the proof is entirely in safe Lean.
-- Unverified (re-run pending): zero large nat literals. The D4 detector could not see any: the export stores numbers as text and the parser only measured integers.
-- Unverified (re-run pending): zero free variables in expression trees. The parser skipped projection and `mdata` subtrees.
-- 11 `needs_recheck` flags, all standard Mathlib reflexive inductives (`Acc`, `TopologicalSpace.GenerateOpen`, etc.). These are routine.
+- Green: zero large nat literals (none above 10,000 bits), so no GMP exploit surface. Confirmed by the re-run; the first run's detector could not read the export's text-encoded numbers.
+- Green: zero free variables in expression trees, including inside projections. The export contains no `mdata`.
+- 11 `needs_recheck` flags, all reflexive inductive types. Nine are standard Mathlib or core types (`Acc`, `WType`, `TopologicalSpace.GenerateOpen`, etc.). The other two flags are one mutual block, `FunctorialResolution.EmbeddedResolution.PrincipalizationCertificate`, which is not in Mathlib as far as we know and is probably the proof's own code. Reflexive inductives are legitimate, but past kernel bugs went through unusual inductives; Sutherland's patched re-check and nanoda accept these.
 
 **Vacuity check:**
 
 Claims on Twitter allege that `anyGeometry`, defined as `fun _ _ _ => True`, renders the proof vacuous.
 
-- Unverified (re-run pending): `anyGeometry` absent from the type (statement) and value (proof term) of all five main theorems at the expression level. The check skipped projection and `mdata` subtrees; the fixed version is re-running.
-- Green: Sutherland's auxiliary data independently confirms `anyGeometry` is absent from the theorem types' transitive dependency cones.
+- Green: `anyGeometry` is absent from both the type (statement) and value (proof term) of all five main theorems at the expression level. Re-confirmed 2026-11-25 by the fixed check, which follows projections (an earlier version skipped them); the export contains no `mdata`.
+- Green: Sutherland's auxiliary data shows the five statements are built from Mathlib definitions plus four statement definitions in a separate `Statements` module (`audit.log`), and the dependency cones of the Robin and Lagarias criterion statements (2,050 and 1,801 declarations) contain no `anyGeometry` and nothing from the proof's own code.
 - Red: `anyGeometry` is defined as `fun _ _ _ => True` and exists in the export. Its role in intermediate lemmas has not been fully traced via transitive dependency analysis.
 
 ## How this compares to other audits
@@ -182,7 +184,7 @@ This scan checks for known exploit families and direct expression-level referenc
 This was the first full run. The parser and detectors were developed and tested on 10K-line and 310 MB partial exports before scaling to the full 7.7 GB. Known risks:
 
 - The parser was tested against the export format but has no independent positive controls yet. Stage 2 (planned, requires a Lean installation) would generate synthetic Lean files with known exploit signatures, export them to NDJSON, and confirm the detectors catch them. The first run was deliberately designed to work without Lean.
-- The D5 detector checks for declarations in modules that required extra computation budget during Sutherland's independent re-verification (unrelated to the vacuity question). It returned zero hits on the first full run due to a confirmed name-matching bug: the detector used `startswith` against bare module names (e.g. `Formalism.PeriodIntegrals...`), but the export uses fully qualified names with a `GlobalTheory.Mem.Top.Bl.` prefix. Fixed to substring match (`in`). Needs re-run.
+- The D5 detector checks for declarations in modules that required extra computation budget during Sutherland's independent re-verification (unrelated to the vacuity question). It returned zero hits on the first full run due to a confirmed name-matching bug: the detector used `startswith` against bare module names (e.g. `Formalism.PeriodIntegrals...`), but the export uses fully qualified names with a `GlobalTheory.Mem.Top.Bl.` prefix. Fixed to substring match (`in`). The re-run (2026-11-25) still found zero, and the cause is structural: declaration names follow namespaces (e.g. `PI.UnitaryGroupMassFormula...`), not module paths, and the export does not record which module a declaration came from. D5 cannot work from the export. The question it was meant to raise is answered by Sutherland's `lean4lean-raised-fuel.log`: all five modules (18 declarations) passed lean4lean with raised fuel (`rc=0`).
 - The vacuity check is deterministic: it parses every line, builds the expression DAG, and looks up whether specific name indices appear in specific expression subtrees. No heuristics. The result is cross-validated against Sutherland's independently produced dependency lists (`robin-deps.txt`, `lagarias-deps.txt`), which agree: zero `anyGeometry` in the theorem types' transitive dependency cones. The direct-reference result is solid. What remains open is the indirect path through intermediate lemmas.
 - Bug fixes during development (expression index handling, name resolution, memory, truncation) were each found during partial runs. The full run is the first time all fixes ran together end to end.
 - Gaps found 2026-11-25 made some checks blind. The parser and the vacuity check read the projection field under the wrong name (`expr` instead of `struct`), no script followed `mdata` wrappers, and natVal (stored as text) was never measured. The cone mapper also merged all inductive types into one nameless entry and never registered constructors or recursors. Each fix was tested on a planted case that the old code missed and the new code catches. Findings that depended on these checks are marked unverified above.
