@@ -22,6 +22,7 @@ results/chunk-flags.csv
 results/checkpoint.txt
 results/vacuity-check.json
 results/cone/
+results/reach/
 results/stage1b/
 results/bak/
 
@@ -30,3 +31,6 @@ provenance/download-verify.log
 
 # Lean build output for validation cases
 scripts/test-cases/lean/.lake/
+
+*.log
+*.csv

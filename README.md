@@ -19,7 +19,7 @@ Andrew Sutherland's independent sandboxed rebuild at `math.mit.edu/~drew/grh/`. 
 
 ## Prerequisites
 
-- At least 8 GB RAM for the exploit scan and vacuity check. The cone mapper's full-run peak is not yet measured; it stops itself before the machine swaps (see below).
+- At least 8 GB RAM for the exploit scan, vacuity check and reachability check. The cone mapper needs more than 16 GB on the full export (measured; it stops itself before the machine swaps, see below).
 - Python 3.12+
 - `zstd` (command-line tool — `brew install zstd` on macOS, `apt install zstd` on Linux)
 - `curl`
@@ -66,9 +66,20 @@ zstd -d --long=30 -c data/sutherland/solution.ndjson.zst 2>/dev/null \
   | python3 -I scripts/vacuity-check.py
 ```
 
+### Reachability check (transitive, full export)
+
+Checks whether any suspect name, or any axiom outside the permitted three, reaches the five main theorems through any chain of declarations, and prints one witness chain per hit (theorem ← lemma ← … ← source):
+
+```sh
+zstd -d --long=30 -c data/sutherland/solution.ndjson.zst 2>/dev/null \
+  | python3 -I scripts/reach.py -o results/reach/reach-report.json
+```
+
+It makes one pass and stores only the declarations and expressions that a suspect or a non-permitted axiom reaches, so memory stays small. It relies on the export listing each declaration after the constants it uses; it counts any exceptions (`forward_refs` in the report), and a non-zero count means the result may miss paths. On the 10K-line sample and on planted cases it agrees exactly with the cone mapper's full cones.
+
 ### Cone mapper (transitive dependency analysis)
 
-Traces transitive declaration-level dependencies to check whether suspect definitions reach the main theorems through intermediate lemmas:
+Computes the full transitive dependency cone of each main theorem (members, sizes, overlap). It answers the same reach questions as the reachability check, but on the full export it needs more than 16 GB of RAM (see below); use it on smaller inputs:
 
 ```sh
 rm -f results/cone/milestones.jsonl
@@ -106,9 +117,10 @@ The scanner decompresses the export through a pipe (`zstd` into Python) and proc
 | Download | 7.7 GB | minimal | minimal | ~45 min (depends on connection) |
 | Exploit scan | no extra | 2–4 GB | 1 core | ~20 min with orjson, ~60 min without |
 | Vacuity check | no extra | 2–4 GB | 1 core | ~15 min with orjson |
-| Cone mapper | ~2 GB pass-1 cache (up to 5 GB more if stopped early) | not yet measured; stops at 80% footprint or on swap growth | 1 core + zstd | not yet measured (pass 1 ~20 min) |
+| Reachability check | no extra | small (not yet measured on the full export) | 1 core | not yet measured |
+| Cone mapper | ~2 GB pass-1 cache (up to 5 GB more if stopped early) | over 16 GB on the full export (measured: stopped at the 13.1 GB ceiling, 28% in) | 1 core + zstd | pass 1 ~21 min; full run does not fit 16 GB |
 
-The cone mapper runs in two passes over the compressed export. Pass 1 counts how many times each expression will be referenced later, storing the counts in a compact array (2 bytes per expression, ~2 GB). Pass 2 builds the dependency cones and deletes each expression's data the moment nothing else needs it. Expressions referenced 65,535 times or more stay in memory for the whole run. When one sub-expression's set of constants already contains the other's, pass 2 reuses that set instead of copying it. An earlier version reached 9 million live entries by 15% of the export and was still growing; the full-run peak with the current code is not yet measured.
+The cone mapper runs in two passes over the compressed export. Pass 1 counts how many times each expression will be referenced later, storing the counts in a compact array (2 bytes per expression, ~2 GB). Pass 2 builds the dependency cones and deletes each expression's data the moment nothing else needs it. Expressions referenced 65,535 times or more stay in memory for the whole run. When one sub-expression's set of constants already contains the other's, pass 2 reuses that set instead of copying it. Measured on 2026-11-25: the live set still grew by about 43,000 entries per million lines (13.1 million entries at line 306 million of 1,081 million), and the run stopped at the 80% memory ceiling. These entries are not leaks: each expression is still needed further down the export. Holding a set of names per expression projects to roughly 30 GB, so the full export needs the reachability check instead.
 
 Each inductive type, constructor and recursor counts as its own constant, so `total_declarations` in `cone-report.json` is higher than the 1,468,418 declaration lines. An inductive type depends on its constructors; recursor rules are not followed, matching Lean's own axiom collection.
 
@@ -127,7 +139,7 @@ All network activity is `curl` GET requests to `math.mit.edu`. All processing is
 **Vacuity check:**
 
 - Traces direct constant references in the expression tree. If `anyGeometry` enters the proof through a chain of intermediate lemmas (A calls B calls C calls `anyGeometry`), this check reports NO for the main theorem even though the dependency exists indirectly.
-- To catch indirect dependencies, a full transitive dependency cone analysis is needed. The cone mapper (`scripts/cone_mapper.py`) does this.
+- To catch indirect dependencies, a transitive analysis is needed. The reachability check (`scripts/reach.py`) does this on the full export; the cone mapper computes full cones on smaller inputs.
 - This check answers "does the expression tree contain it?" — not "could the proof be restructured to avoid it?"
 
 **General:**
