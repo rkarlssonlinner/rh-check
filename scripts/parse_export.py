@@ -26,6 +26,27 @@ F_LARGE_NAT = 0x04  # subtree contains a natVal > 10K bits
 F_HUGE_NAT  = 0x08  # subtree contains a natVal > 1M bits
 F_TRUE      = 0x10  # subtree contains a const reference to True
 
+_EXACT_DIGITS = 4000  # below CPython's default int/str limit of 4300 digits
+_LOG2_10 = 3.321928094887362
+
+
+def _nat_bits(val):
+    """Bit length of a natVal, or None if malformed.
+
+    The export stores natVal as a decimal string (checked on the 10K-line
+    sample). Above _EXACT_DIGITS the length is estimated from the digit
+    count, which is off by at most 4 bits and avoids a slow conversion of
+    a giant literal.
+    """
+    if isinstance(val, int):
+        return val.bit_length()
+    if not (isinstance(val, str) and val.isascii() and val.isdigit()):
+        return None
+    s = val.lstrip("0")
+    if len(s) <= _EXACT_DIGITS:
+        return int(s or "0").bit_length()
+    return int(len(s) * _LOG2_10) + 1
+
 
 class ExportParser:
     def __init__(self, track_const_refs=False):
@@ -116,12 +137,27 @@ class ExportParser:
             struct_name = p.get("typeName", p.get("struct", None))
             if struct_name is not None:
                 self.expr_proj_info.setdefault(idx, []).append((struct_name,))
-            children = [p["expr"]] if "expr" in p else []
+            # The export names the projected expression "struct"; an
+            # earlier version read "expr" and dropped every proj subtree.
+            if "struct" in p:
+                children = [p["struct"]]
+            else:
+                self.counts["proj_skipped"] += 1
+
+        elif "mdata" in expr:
+            # Field name not yet seen in our sample; misses are counted.
+            md = expr["mdata"]
+            e = md.get("expr") if isinstance(md, dict) else None
+            if isinstance(e, int):
+                children = [e]
+            else:
+                self.counts["mdata_skipped"] += 1
 
         elif "natVal" in expr:
-            val = expr["natVal"]
-            if isinstance(val, int):
-                bits = val.bit_length()
+            bits = _nat_bits(expr["natVal"])
+            if bits is None:
+                self.counts["natVal_unparsed"] += 1
+            else:
                 self.expr_nat_bits[idx] = bits
                 if bits > 10_000:
                     self.expr_flags[idx] |= F_LARGE_NAT

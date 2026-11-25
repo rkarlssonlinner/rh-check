@@ -78,6 +78,9 @@ found_suspects = {}   # fully_qualified_name -> name_idx
 found_decls = {}      # fully_qualified_name -> {kind, line, type_expr, value_expr}
 line_num = 0
 decl_count = 0
+mdata_seen = 0
+mdata_skipped = 0     # mdata lines without an int "expr" child
+proj_skipped = 0      # proj lines without a "struct" child
 
 # ---------- helpers ----------
 
@@ -113,6 +116,7 @@ def process_expr(idx, obj):
     get an entry in expr_suspect, keeping memory proportional to the number
     of tainted expressions rather than total expressions.
     """
+    global mdata_seen, mdata_skipped, proj_skipped
     children = []
     bits = 0
 
@@ -130,7 +134,23 @@ def process_expr(idx, obj):
         le = obj["letE"]
         children = [le["type"], le["value"], le["body"]]
     elif "proj" in obj:
-        children = [obj["proj"]["expr"]] if "expr" in obj["proj"] else []
+        # The export names the projected expression "struct" (checked on
+        # the 10K-line sample); an earlier version read "expr" and so
+        # dropped every proj subtree.
+        p = obj["proj"]
+        if "struct" in p:
+            children = [p["struct"]]
+        else:
+            proj_skipped += 1
+    elif "mdata" in obj:
+        # Field name not yet seen in our sample; misses are counted.
+        mdata_seen += 1
+        md = obj["mdata"]
+        e = md.get("expr") if isinstance(md, dict) else None
+        if isinstance(e, int):
+            children = [e]
+        else:
+            mdata_skipped += 1
 
     for child_idx in children:
         bits |= expr_suspect.get(child_idx, 0)
@@ -283,6 +303,9 @@ results = {
         "declarations": decl_count,
         "elapsed_seconds": round(elapsed, 1),
         "complete": decl_count >= 1_400_000,
+        "mdata_seen": mdata_seen,
+        "mdata_skipped": mdata_skipped,
+        "proj_skipped": proj_skipped,
     },
     "suspects": {},
     "theorems": {},
@@ -295,6 +318,10 @@ log(f"  lines scanned:    {line_num:,}")
 log(f"  declarations:     {decl_count:,}")
 log(f"  time:             {elapsed:.1f}s")
 log(f"  scan complete:    {'YES' if results['scan']['complete'] else 'NO (need full export)'}")
+log(f"  mdata:            {mdata_seen:,} seen, {mdata_skipped:,} skipped")
+log(f"  proj skipped:     {proj_skipped:,}")
+if mdata_skipped or proj_skipped:
+    log(f"  WARNING: skipped subtrees; a NO below may miss suspect names")
 
 # suspect names
 log(f"\n--- Suspect names ---")

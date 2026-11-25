@@ -108,6 +108,8 @@ The scanner decompresses the export through a pipe (`zstd` into Python) and proc
 
 The cone mapper runs in two passes over the compressed export. Pass 1 counts how many times each expression will be referenced later, storing the counts in a compact array (2 bytes per expression, ~2 GB). Pass 2 builds the dependency cones and deletes each expression's data the moment nothing else needs it. Expressions referenced 65,535 times or more stay in memory for the whole run. When one sub-expression's set of constants already contains the other's, pass 2 reuses that set instead of copying it. An earlier version reached 9 million live entries by 15% of the export and was still growing; the full-run peak with the current code is not yet measured.
 
+Each inductive type, constructor and recursor counts as its own constant, so `total_declarations` in `cone-report.json` is higher than the 1,468,418 declaration lines. An inductive type depends on its constructors; recursor rules are not followed, matching Lean's own axiom collection.
+
 All scans are single-threaded and stream-based. They can run in parallel if you have 8+ GB of free RAM, or sequentially on a machine with less. The `--chunk-next` mode lets you download and scan in smaller pieces (e.g., 250 MB at a time) if you want to inspect intermediate results, but each chunk re-decompresses from the start, so downloading everything at once is faster overall.
 
 All network activity is `curl` GET requests to `math.mit.edu`. All processing is local. Nothing is installed system-wide — dependencies go into a Python venv.
@@ -139,17 +141,17 @@ Full scan of all 1,468,418 declarations in the export. Results below use a green
 
 **Exploit scan:**
 
-- Green: zero `suspicious` flags across the entire export.
+- Unverified (re-run pending): zero `suspicious` flags across the entire export. Two detectors that raise `suspicious` flags had gaps: D4 could not read numbers at all, and D7 skipped free variables inside projections and `mdata`.
 - Green: zero unsafe or partial declarations — the proof is entirely in safe Lean.
-- Green: zero large nat literals — no GMP exploit surface.
-- Green: zero free variables in expression trees — the export is well-formed.
+- Unverified (re-run pending): zero large nat literals. The D4 detector could not see any: the export stores numbers as text and the parser only measured integers.
+- Unverified (re-run pending): zero free variables in expression trees. The parser skipped projection and `mdata` subtrees.
 - 11 `needs_recheck` flags, all standard Mathlib reflexive inductives (`Acc`, `TopologicalSpace.GenerateOpen`, etc.). These are routine.
 
 **Vacuity check:**
 
 Claims on Twitter allege that `anyGeometry`, defined as `fun _ _ _ => True`, renders the proof vacuous.
 
-- Green: `anyGeometry` is absent from both the type (statement) and value (proof term) of all five main theorems at the expression level.
+- Unverified (re-run pending): `anyGeometry` absent from the type (statement) and value (proof term) of all five main theorems at the expression level. The check skipped projection and `mdata` subtrees; the fixed version is re-running.
 - Green: Sutherland's auxiliary data independently confirms `anyGeometry` is absent from the theorem types' transitive dependency cones.
 - Red: `anyGeometry` is defined as `fun _ _ _ => True` and exists in the export. Its role in intermediate lemmas has not been fully traced via transitive dependency analysis.
 
@@ -183,6 +185,7 @@ This was the first full run. The parser and detectors were developed and tested 
 - The D5 detector checks for declarations in modules that required extra computation budget during Sutherland's independent re-verification (unrelated to the vacuity question). It returned zero hits on the first full run due to a confirmed name-matching bug: the detector used `startswith` against bare module names (e.g. `Formalism.PeriodIntegrals...`), but the export uses fully qualified names with a `GlobalTheory.Mem.Top.Bl.` prefix. Fixed to substring match (`in`). Needs re-run.
 - The vacuity check is deterministic: it parses every line, builds the expression DAG, and looks up whether specific name indices appear in specific expression subtrees. No heuristics. The result is cross-validated against Sutherland's independently produced dependency lists (`robin-deps.txt`, `lagarias-deps.txt`), which agree: zero `anyGeometry` in the theorem types' transitive dependency cones. The direct-reference result is solid. What remains open is the indirect path through intermediate lemmas.
 - Bug fixes during development (expression index handling, name resolution, memory, truncation) were each found during partial runs. The full run is the first time all fixes ran together end to end.
+- Gaps found 2026-11-25 made some checks blind. The parser and the vacuity check read the projection field under the wrong name (`expr` instead of `struct`), no script followed `mdata` wrappers, and natVal (stored as text) was never measured. The cone mapper also merged all inductive types into one nameless entry and never registered constructors or recursors. Each fix was tested on a planted case that the old code missed and the new code catches. Findings that depended on these checks are marked unverified above.
 
 We treat these results as a first pass, not a final verdict.
 

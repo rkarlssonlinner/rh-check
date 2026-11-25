@@ -59,7 +59,7 @@ _GUARD_EXIT_CODE = 3
 # Reference counts: one uint16 per expression. A count that reaches _SAT
 # stays at _SAT and that expression is never freed.
 _SAT = 65535
-_CACHE_FORMAT = 2  # bump when pass-1 counting changes
+_CACHE_FORMAT = 3  # bump when pass-1 counting changes
 
 
 def _get_physical_ram():
@@ -243,10 +243,10 @@ def _pass1_ref_counts(path, err):
                 for kind in ("def", "thm", "inductive", "quot", "axiom",
                              "opaque"):
                     if kind in obj:
-                        for eid in dict.fromkeys(
-                                _decl_expr_ids(obj[kind])):
-                            _grow(eid)
-                            _inc(eid)
+                        for _, _, eids, _ in _decl_units(kind, obj[kind]):
+                            for eid in dict.fromkeys(eids):
+                                _grow(eid)
+                                _inc(eid)
                         break
 
             if line_num % 10_000_000 == 0:
@@ -862,23 +862,23 @@ def main(input_path=None):
             for kind in ("def", "thm", "inductive", "quot", "axiom",
                          "opaque"):
                 if kind in obj:
-                    decl = obj[kind]
-                    name_idx = decl.get("name", 0)
-                    name = resolve_name(name_idx, name_parts, name_cache)
+                    for name_idx, unit_kind, eids, extra in _decl_units(
+                            kind, obj[kind]):
+                        name = resolve_name(name_idx, name_parts, name_cache)
 
-                    all_refs = set()
-                    for eid in dict.fromkeys(_decl_expr_ids(decl)):
-                        all_refs |= get_and_release(eid)
+                        all_refs = set(extra)
+                        for eid in dict.fromkeys(eids):
+                            all_refs |= get_and_release(eid)
 
-                    ref_names = set()
-                    for nidx in all_refs:
-                        rname = resolve_name(nidx, name_parts, name_cache)
-                        if rname and rname != name:
-                            ref_names.add(rname)
+                        ref_names = set()
+                        for nidx in all_refs:
+                            rname = resolve_name(nidx, name_parts, name_cache)
+                            if rname and rname != name:
+                                ref_names.add(rname)
 
-                    decls[name] = {"kind": kind, "line": line_num}
-                    # tuple: ~8 B per name vs ~35 B in a set
-                    deps[name] = tuple(ref_names)
+                        decls[name] = {"kind": unit_kind, "line": line_num}
+                        # tuple: ~8 B per name vs ~35 B in a set
+                        deps[name] = tuple(ref_names)
                     break
 
         if line_num % 1_000_000 == 0:
@@ -1081,27 +1081,32 @@ def main(input_path=None):
         pass
 
 
-def _decl_expr_ids(decl):
-    """Extract all expression IDs referenced by a declaration."""
-    ids = []
-    if "type" in decl:
-        ids.append(decl["type"])
-    if "value" in decl:
-        ids.append(decl["value"])
-    if "ctors" in decl:
-        for ctor in decl["ctors"]:
-            if "type" in ctor:
-                ids.append(ctor["type"])
-    if "recs" in decl:
-        for rec in decl["recs"]:
-            if "type" in rec:
-                ids.append(rec["type"])
-            for rule in rec.get("rules", []):
-                if "val" in rule:
-                    ids.append(rule["val"])
-    if "all" in decl:
-        pass
-    return ids
+def _decl_units(kind, decl):
+    """Constants introduced by one declaration line.
+
+    Returns a list of (name_idx, kind, expr_ids, extra_name_idxs).
+    Most lines introduce one constant with top-level "name", "type" and
+    "value". An inductive line has no top-level name: it lists its types,
+    constructors and recursors (checked on the 10K-line sample), and each
+    becomes its own constant. An inductive type also depends on its
+    constructors. Recursor rules are not followed; Lean's CollectAxioms
+    does the same.
+    """
+    if kind != "inductive":
+        ids = [decl[k] for k in ("type", "value") if k in decl]
+        return [(decl.get("name", 0), kind, ids, ())]
+    units = []
+    for t in decl.get("types", []):
+        units.append((t.get("name", 0), "inductive",
+                      [t["type"]] if "type" in t else [],
+                      t.get("ctors", [])))
+    for c in decl.get("ctors", []):
+        units.append((c.get("name", 0), "ctor",
+                      [c["type"]] if "type" in c else [], ()))
+    for r in decl.get("recs", []):
+        units.append((r.get("name", 0), "rec",
+                      [r["type"]] if "type" in r else [], ()))
+    return units
 
 
 if __name__ == "__main__":

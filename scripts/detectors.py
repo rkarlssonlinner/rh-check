@@ -322,6 +322,14 @@ if __name__ == "__main__":
         print(f"  newly scanned:       {new_decls:,}", file=sys.stderr)
     print(f"Flags raised: {flag_count:,}", file=sys.stderr)
     print(f"Time: {elapsed:.2f}s", file=sys.stderr)
+    parse_counts = _parser_ref[0].counts if _parser_ref[0] else {}
+    print(f"mdata seen: {parse_counts.get('expr_mdata', 0):,}", file=sys.stderr)
+    skipped = {k: parse_counts.get(k, 0)
+               for k in ("mdata_skipped", "proj_skipped", "natVal_unparsed")}
+    print(f"Skipped: {skipped}", file=sys.stderr)
+    if any(skipped.values()):
+        print("WARNING: skipped subtrees or literals; detectors may miss "
+              "flags inside them", file=sys.stderr)
 
     if flag_count:
         print(f"\nBy detector:", file=sys.stderr)
