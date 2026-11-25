@@ -1,6 +1,6 @@
 # rh-check
 
-Read-only scan of the Lean 4 kernel export of Alpöge's RH proof for known exploit families and vacuity claims.
+Read-only streaming scan of the Lean 4 kernel export of Alpöge's RH proof for known exploit families and vacuity claims. A complementary check that never compiles Lean and never needs the full 62 GB on disk.
 
 ## What this does
 
@@ -13,10 +13,11 @@ The scanner works directly on the export data and does not require a Lean instal
 
 ## Source
 
-Andrew Sutherland's independent sandboxed rebuild at `math.mit.edu/~drew/grh/`. SHA-256 cross-verified against three independent builds.
+Andrew Sutherland's independent sandboxed rebuild at `math.mit.edu/~drew/grh/`. SHA-256 hashes match across three independent builds (Sutherland, Zeng, ours).
 
 ## Prerequisites
 
+- At least 16 GB RAM (the cone mapper peaks at ~5.5 GB; other scripts are lighter)
 - Python 3.12+
 - `zstd` (command-line tool — `brew install zstd` on macOS, `apt install zstd` on Linux)
 - `curl`
