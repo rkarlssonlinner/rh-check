@@ -95,9 +95,11 @@ The scanner decompresses the export through a pipe (`zstd` into Python) and proc
 | Download | 7.7 GB | minimal | minimal | ~45 min (depends on connection) |
 | Exploit scan | no extra | 2–4 GB | 1 core | ~20 min with orjson, ~60 min without |
 | Vacuity check | no extra | 2–4 GB | 1 core | ~15 min with orjson |
-| Cone mapper | no extra | exceeds 16 GB (partial run) | 1 core | ~19 min to ceiling |
+| Cone mapper | no extra | ~4–6 GB (two-pass mode) | 1 core + zstd | ~80 min |
 
-Both scans are single-threaded and stream-based. They can run in parallel if you have 8+ GB of free RAM, or sequentially on a machine with less. The `--chunk-next` mode lets you download and scan in smaller pieces (e.g., 250 MB at a time) if you want to inspect intermediate results, but each chunk re-decompresses from the start, so downloading everything at once is faster overall.
+The cone mapper runs in two passes over the compressed export. Pass 1 counts how many times each expression will be referenced later, storing the counts in a compact array (~1 GB). Pass 2 builds the dependency cones and deletes each expression's data the moment nothing else needs it. Without this, data for all ~1 billion expressions stays in memory (~8 GB); with it, the live set stays at a few million entries (~4 GB total RSS).
+
+All scans are single-threaded and stream-based. They can run in parallel if you have 8+ GB of free RAM, or sequentially on a machine with less. The `--chunk-next` mode lets you download and scan in smaller pieces (e.g., 250 MB at a time) if you want to inspect intermediate results, but each chunk re-decompresses from the start, so downloading everything at once is faster overall.
 
 All network activity is `curl` GET requests to `math.mit.edu`. All processing is local. Nothing is installed system-wide — dependencies go into a Python venv.
 
@@ -112,7 +114,7 @@ All network activity is `curl` GET requests to `math.mit.edu`. All processing is
 **Vacuity check:**
 
 - Traces direct constant references in the expression tree. If `anyGeometry` enters the proof through a chain of intermediate lemmas (A calls B calls C calls `anyGeometry`), this check reports NO for the main theorem even though the dependency exists indirectly.
-- To catch indirect dependencies, a full transitive dependency cone analysis is needed. The cone mapper (`scripts/cone_mapper.py`) does this but currently exceeds 16 GB RAM on the full export. It is instrumented with memory diagnostics; a fix is in progress.
+- To catch indirect dependencies, a full transitive dependency cone analysis is needed. The cone mapper (`scripts/cone_mapper.py`) does this.
 - This check answers "does the expression tree contain it?" — not "could the proof be restructured to avoid it?"
 
 **General:**
