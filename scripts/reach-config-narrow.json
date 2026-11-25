@@ -1,0 +1,15 @@
+{
+  "_note": "reach.py config without the two widely used shaLen definitions (Formalism.GaloisCohomology.shaLen, Formalism.BasicNotions.Rows.Data.shaLen), which each mark ~70,000 declarations and exhaust 16 GB. A full name matches only itself.",
+  "theorem_names": [
+    "riemannHypothesis",
+    "riemannZeta_eq_zero_re",
+    "LFunction_ne_zero_of_half_lt_re",
+    "LFunction_eq_zero_re",
+    "LFunction_eq_zero_re_of_isPrimitive"
+  ],
+  "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+  "suspect_names": [
+    "anyGeometry", "geoCl", "GeoP", "geoOf", "UnusedSlot72", "sha_eq",
+    "GlobalTheory.Mem.RowsRest.shaLen"
+  ]
+}

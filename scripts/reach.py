@@ -249,12 +249,13 @@ def main():
                     redo_late(clear=True)
                 break
 
-        if line_num % 10_000_000 == 0:
+        if line_num % 1_000_000 == 0:
             fp = _get_footprint()
-            err(f"  {line_num/1e6:.0f}M lines, {decl_lines:,} decl lines, "
-                f"{len(expr_taint):,} marked exprs, {len(decl_taint):,} "
-                f"marked decls, footprint {fp/2**30:.2f} GB, "
-                f"{time.monotonic()-t0:.0f}s")
+            if line_num % 10_000_000 == 0:
+                err(f"  {line_num/1e6:.0f}M lines, {decl_lines:,} decl lines,"
+                    f" {len(expr_taint):,} marked exprs, {len(decl_taint):,}"
+                    f" marked decls, footprint {fp/2**30:.2f} GB, "
+                    f"{time.monotonic()-t0:.0f}s")
             if fp >= MEMORY_CEILING:
                 err(f"STOP: footprint {fp/2**30:.2f} GB >= ceiling")
                 complete = False
