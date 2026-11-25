@@ -1,0 +1,2 @@
+# Optional: 3-10x faster JSON parsing. Scanner falls back to stdlib json if missing.
+orjson==3.13.0
