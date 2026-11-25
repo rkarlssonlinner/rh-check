@@ -1,7 +1,7 @@
 """
 Build the dependency cone of the five main theorems.
 
-Two-pass mode (recommended for the full export, ~5.5 GB RSS):
+Two-pass mode (recommended for the full export; full-run peak not yet measured):
   Pass 1 — lightweight scan to count per-expression references.
   Pass 2 — parse, compute deps, free each expression when its last reader is done.
 
@@ -18,18 +18,23 @@ Usage:
 
 Diagnostics (env vars):
   CONE_GC_DISABLE=1  — disable Python's cyclic GC (no cycles in this code)
-  CONE_MEM_CEILING=80 — RSS ceiling as % of physical RAM (default: 80)
+  CONE_MEM_CEILING=80 — memory footprint ceiling as % of physical RAM (default: 80)
+  CONE_SWAP_GROWTH_GB=2 — stop if system swap grows by more than this (default: 2)
+
+Exit code 3 means the run stopped at a memory guard (partial results written).
 """
 import sys
 import os
 import json
 import collections
+import ctypes
 import itertools
 import time
 import gc
 import resource
 import signal
 import subprocess
+from array import array
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -46,7 +51,15 @@ EMPTY = frozenset()
 
 _DIAG_GC_DISABLE = os.environ.get("CONE_GC_DISABLE", "") == "1"
 _DIAG_CEILING_PCT = int(os.environ.get("CONE_MEM_CEILING", "80"))
+_SWAP_GROWTH_LIMIT = int(
+    float(os.environ.get("CONE_SWAP_GROWTH_GB", "2")) * 1024**3)
 _DIAG_HEAVY_INTERVAL = 10  # heavy milestone every N million lines
+_GUARD_EXIT_CODE = 3
+
+# Reference counts: one uint16 per expression. A count that reaches _SAT
+# stays at _SAT and that expression is never freed.
+_SAT = 65535
+_CACHE_FORMAT = 2  # bump when pass-1 counting changes
 
 
 def _get_physical_ram():
@@ -55,6 +68,80 @@ def _get_physical_ram():
         return int(out.strip())
     except Exception:
         return 16 * 1024**3
+
+
+def _get_current_rss():
+    """Current RSS in bytes (not peak). Falls back to ru_maxrss."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            text=True, timeout=5, stderr=subprocess.DEVNULL,
+        )
+        return int(out.strip()) * 1024
+    except Exception:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
+# macOS: RSS excludes compressed and swapped pages, so it stops growing
+# when the system starts to compress. phys_footprint includes them.
+# Layouts copied from <sys/resource.h> and <sys/sysctl.h>.
+class _RusageInfoV2(ctypes.Structure):
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (n, ctypes.c_uint64) for n in (
+            "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups",
+            "ri_interrupt_wkups", "ri_pageins", "ri_wired_size",
+            "ri_resident_size", "ri_phys_footprint",
+            "ri_proc_start_abstime", "ri_proc_exit_abstime",
+            "ri_child_user_time", "ri_child_system_time",
+            "ri_child_pkg_idle_wkups", "ri_child_interrupt_wkups",
+            "ri_child_pageins", "ri_child_elapsed_abstime",
+            "ri_diskio_bytesread", "ri_diskio_byteswritten")]
+
+
+class _XswUsage(ctypes.Structure):
+    _fields_ = [("xsu_total", ctypes.c_uint64),
+                ("xsu_avail", ctypes.c_uint64),
+                ("xsu_used", ctypes.c_uint64),
+                ("xsu_pagesize", ctypes.c_uint32),
+                ("xsu_encrypted", ctypes.c_int32)]
+
+
+_RUSAGE_INFO_V2 = 2
+
+try:
+    _libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    _libsystem.proc_pid_rusage.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    _libsystem.proc_pid_rusage.restype = ctypes.c_int
+    _libsystem.sysctlbyname.argtypes = [
+        ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p, ctypes.c_size_t]
+    _libsystem.sysctlbyname.restype = ctypes.c_int
+except (OSError, AttributeError):
+    _libsystem = None
+
+
+def _get_footprint():
+    """Physical footprint in bytes (what Activity Monitor shows).
+    Falls back to RSS when libproc is unavailable."""
+    if _libsystem is not None:
+        ru = _RusageInfoV2()
+        if _libsystem.proc_pid_rusage(
+                os.getpid(), _RUSAGE_INFO_V2, ctypes.byref(ru)) == 0:
+            return ru.ri_phys_footprint
+    return _get_current_rss()
+
+
+def _get_swap_used():
+    """System-wide swap in use, in bytes. None if unavailable."""
+    if _libsystem is None:
+        return None
+    xsw = _XswUsage()
+    size = ctypes.c_size_t(ctypes.sizeof(xsw))
+    if _libsystem.sysctlbyname(b"vm.swapusage", ctypes.byref(xsw),
+                               ctypes.byref(size), None, 0) != 0:
+        return None
+    return xsw.xsu_used
 
 
 PHYSICAL_RAM = _get_physical_ram()
@@ -103,6 +190,11 @@ def _expr_child_idxs(obj):
         return [le["type"], le["value"], le["body"]]
     if "proj" in obj:
         return [obj["proj"]["struct"]]
+    if "mdata" in obj:
+        # Field name not yet seen in our sample; main() counts misses.
+        md = obj["mdata"]
+        e = md.get("expr") if isinstance(md, dict) else None
+        return [e] if isinstance(e, int) else []
     return []
 
 
@@ -122,7 +214,7 @@ def _open_ndjson_stream(path):
 def _pass1_ref_counts(path, err):
     """Pass 1: count how many times each expression index is referenced."""
     err(f"Pass 1: counting references in {path}")
-    ref_counts = bytearray()
+    ref_counts = array("H")
     stream, proc = _open_ndjson_stream(path)
     line_num = 0
     t0 = time.monotonic()
@@ -130,10 +222,10 @@ def _pass1_ref_counts(path, err):
     def _grow(needed_idx):
         gap = needed_idx + 1 - len(ref_counts)
         if gap > 0:
-            ref_counts.extend(bytes(gap))
+            ref_counts.frombytes(bytes(gap * ref_counts.itemsize))
 
     def _inc(idx):
-        if ref_counts[idx] < 255:
+        if ref_counts[idx] < _SAT:
             ref_counts[idx] += 1
 
     try:
@@ -161,7 +253,7 @@ def _pass1_ref_counts(path, err):
                 elapsed = time.monotonic() - t0
                 err(f"  Pass 1: {line_num/1e6:.0f}M lines, "
                     f"{len(ref_counts):,} slots, "
-                    f"{len(ref_counts) / (1024**2):.0f} MB, "
+                    f"{_nbytes(ref_counts) / (1024**2):.0f} MB, "
                     f"{elapsed:.0f}s")
     finally:
         stream.close()
@@ -172,7 +264,87 @@ def _pass1_ref_counts(path, err):
     err(f"Pass 1 complete: {line_num:,} lines, "
         f"{len(ref_counts):,} expression slots, "
         f"{elapsed:.1f}s")
+
+    _save_pass1_cache(path, ref_counts, line_num, err)
     return ref_counts, line_num
+
+
+def _nbytes(ref_counts):
+    return len(ref_counts) * ref_counts.itemsize
+
+
+def _pass1_cache_paths():
+    cache_dir = os.path.join(PROJECT_DIR, "results", "cone")
+    return (os.path.join(cache_dir, "pass1-cache.meta.json"),
+            os.path.join(cache_dir, "pass1-cache.bin"))
+
+
+def _save_pass1_cache(path, ref_counts, total_lines, err):
+    meta_path, bin_path = _pass1_cache_paths()
+    os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+    st = os.stat(path)
+    meta = {
+        "format": _CACHE_FORMAT,
+        "saturation": _SAT,
+        "itemsize": ref_counts.itemsize,
+        "input_path": os.path.abspath(path),
+        "input_size": st.st_size,
+        "input_mtime": st.st_mtime,
+        "total_lines": total_lines,
+        "ref_counts_len": len(ref_counts),
+    }
+    try:
+        with open(bin_path, "wb") as f:
+            ref_counts.tofile(f)  # writes in blocks, no full copy
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+        err(f"Pass 1 cache saved ({_nbytes(ref_counts)/(1024**2):.0f} MB)")
+    except Exception as e:
+        err(f"WARNING: failed to save pass 1 cache: {e}")
+
+
+def _load_pass1_cache(path, err):
+    """Load cached ref_counts if the input file hasn't changed."""
+    meta_path, bin_path = _pass1_cache_paths()
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+        st = os.stat(path)
+        if (meta.get("format") != _CACHE_FORMAT
+                or meta.get("saturation") != _SAT
+                or meta.get("itemsize") != array("H").itemsize):
+            err("Pass 1 cache from an older format, re-running")
+            return None
+        if (meta["input_path"] != os.path.abspath(path)
+                or meta["input_size"] != st.st_size
+                or meta["input_mtime"] != st.st_mtime):
+            err("Pass 1 cache stale (input changed), re-running")
+            return None
+        n = meta["ref_counts_len"]
+        ref_counts = array("H", [0]) * n
+        if os.path.getsize(bin_path) != _nbytes(ref_counts):
+            err("Pass 1 cache corrupt (size mismatch), re-running")
+            return None
+        # Read straight into the array: no temporary bytes copy.
+        mv = memoryview(ref_counts).cast("B")
+        pos = 0
+        with open(bin_path, "rb") as f:
+            while pos < len(mv):
+                got = f.readinto(mv[pos:pos + (1 << 26)])
+                if not got:
+                    break
+                pos += got
+        full = pos == len(mv)
+        mv.release()
+        if not full:
+            err("Pass 1 cache corrupt (short read), re-running")
+            return None
+        err(f"Pass 1 loaded from cache: {meta['total_lines']:,} lines, "
+            f"{len(ref_counts):,} slots "
+            f"({_nbytes(ref_counts)/(1024**2):.0f} MB)")
+        return ref_counts, meta["total_lines"]
+    except (FileNotFoundError, KeyError, json.JSONDecodeError):
+        return None
 
 
 def load_config():
@@ -213,15 +385,22 @@ def main(input_path=None):
 
     name_parts = {}
     name_cache = {}
-    intern_cache = {EMPTY: EMPTY}
+    intern_cache = {} if two_pass else {EMPTY: EMPTY}
     decls = {}
     deps = {}
     line_num = 0
+    mdata_seen = 0
+    mdata_skipped = 0  # mdata lines without an int "expr" child
+    swap_baseline = _get_swap_used()
     t0 = time.monotonic()
 
     if two_pass:
-        ref_counts, total_lines = _pass1_ref_counts(input_path, lambda m: print(
-            m, file=sys.stderr, flush=True))
+        _err = lambda m: print(m, file=sys.stderr, flush=True)
+        cached = _load_pass1_cache(input_path, _err)
+        if cached is not None:
+            ref_counts, total_lines = cached
+        else:
+            ref_counts, total_lines = _pass1_ref_counts(input_path, _err)
         const_refs = {}
         diag_freed = 0
         diag_live_hwm = 0
@@ -264,18 +443,30 @@ def main(input_path=None):
     else:
         err(f"DIAGNOSTIC: GC enabled (thresholds: {gc.get_threshold()})")
     err(f"DIAGNOSTIC: physical RAM {PHYSICAL_RAM / (1024**3):.1f} GB, "
-        f"ceiling {MEMORY_CEILING / (1024**3):.1f} GB ({_DIAG_CEILING_PCT}%)")
+        f"footprint ceiling {MEMORY_CEILING / (1024**3):.1f} GB "
+        f"({_DIAG_CEILING_PCT}%)")
+    if swap_baseline is None:
+        err("DIAGNOSTIC: swap usage unavailable, swap guard OFF")
+    else:
+        err(f"DIAGNOSTIC: swap in use at start "
+            f"{swap_baseline / (1024**3):.2f} GB, stop if it grows by "
+            f"{_SWAP_GROWTH_LIMIT / (1024**3):.1f} GB")
     if two_pass:
         err(f"Pass 2: processing with {len(ref_counts):,} ref-count slots "
-            f"({len(ref_counts) / (1024**2):.0f} MB)")
+            f"({_nbytes(ref_counts) / (1024**2):.0f} MB), "
+            f"{ref_counts.count(_SAT):,} saturated at {_SAT}")
 
-    def intern_set(s):
-        fs = frozenset(s) if not isinstance(s, frozenset) else s
-        cached = intern_cache.get(fs)
-        if cached is not None:
-            return cached
-        intern_cache[fs] = fs
-        return fs
+    if two_pass:
+        def intern_set(s):
+            return frozenset(s) if not isinstance(s, frozenset) else s
+    else:
+        def intern_set(s):
+            fs = frozenset(s) if not isinstance(s, frozenset) else s
+            cached = intern_cache.get(fs)
+            if cached is not None:
+                return cached
+            intern_cache[fs] = fs
+            return fs
 
     if two_pass:
         def get_refs(idx):
@@ -286,7 +477,7 @@ def main(input_path=None):
             val = const_refs.get(idx, EMPTY)
             if idx < len(ref_counts):
                 c = ref_counts[idx]
-                if 0 < c < 255:
+                if 0 < c < _SAT:
                     c -= 1
                     ref_counts[idx] = c
                     if c == 0:
@@ -298,7 +489,7 @@ def main(input_path=None):
             nonlocal diag_freed
             if idx < len(ref_counts):
                 c = ref_counts[idx]
-                if 0 < c < 255:
+                if 0 < c < _SAT:
                     c -= 1
                     ref_counts[idx] = c
                     if c == 0:
@@ -366,17 +557,18 @@ def main(input_path=None):
     def diag_checkpoint(is_heavy):
         nonlocal diag_prev_rss, diag_prev_line
 
-        ru = resource.getrusage(resource.RUSAGE_SELF)
-        rss = ru.ru_maxrss  # bytes on macOS
+        rss = _get_footprint()
+        swap = _get_swap_used()
         elapsed = time.monotonic() - t0
 
         record = {
             "t": "heavy" if is_heavy else "light",
             "line": line_num,
             "wall_s": round(elapsed, 2),
-            "rss_bytes": rss,
-            "rss_pct": round(100 * rss / PHYSICAL_RAM, 1),
-            "ceil_pct": round(100 * rss / MEMORY_CEILING, 1),
+            "footprint_bytes": rss,
+            "footprint_pct": round(100 * rss / PHYSICAL_RAM, 1),
+            "ceil_pct": round(100 * rss / MEMORY_CEILING, 1) if MEMORY_CEILING else None,
+            "swap_used_bytes": swap,
             "const_refs_len": len(const_refs),
             "intern_len": len(intern_cache),
             "deps_len": len(deps),
@@ -435,26 +627,44 @@ def main(input_path=None):
         oom_str = ""
         if "est_oom_at_line" in record:
             oom_str = f", est OOM at {record['est_oom_at_line']/1e6:.0f}M"
-        err(f"  DIAG: RSS={rss/(1024**2):.0f}MB ({record['rss_pct']}% phys, "
-            f"{record['ceil_pct']}% ceil){oom_str}, GC={sum(_gc_time):.1f}s")
+        swap_str = "" if swap is None else f", swap={swap/(1024**3):.2f}GB"
+        err(f"  DIAG: footprint={rss/(1024**2):.0f}MB "
+            f"({record['footprint_pct']}% phys, "
+            f"{record['ceil_pct']}% ceil){oom_str}{swap_str}, "
+            f"GC={sum(_gc_time):.1f}s")
 
-        return rss
+        return rss, swap
 
     def dump_partial(reason):
         out_dir = os.path.join(PROJECT_DIR, "results", "cone")
         os.makedirs(out_dir, exist_ok=True)
         partial_path = os.path.join(out_dir, "cone-partial.json")
+        deps_path = os.path.join(out_dir, "cone-partial-deps.jsonl")
 
         total_estimate = 1_080_000_000
         pct = round(100 * line_num / total_estimate, 1)
 
-        est_bytes = len(deps) * 2000
-        deps_to_write = deps
-        if est_bytes > _PARTIAL_CAP:
-            max_entries = int(_PARTIAL_CAP / 2000)
-            keys = list(deps.keys())[-max_entries:]
-            deps_to_write = {k: deps[k] for k in keys}
-            err(f"  Truncating partial dump: {max_entries:,} of "
+        # Stream one declaration per line; no in-memory copy of deps.
+        # json.dumps output is ASCII, so len(line) is its size in bytes.
+        deps_bytes = 0
+        deps_written = 0
+        deps_truncated = False
+        try:
+            with open(deps_path, "w") as f:
+                for name, refs in deps.items():
+                    line = json.dumps({"decl": name, "refs": sorted(refs)},
+                                      separators=(",", ":")) + "\n"
+                    if deps_bytes + len(line) > _PARTIAL_CAP:
+                        deps_truncated = True
+                        break
+                    f.write(line)
+                    deps_bytes += len(line)
+                    deps_written += 1
+        except Exception as e:
+            err(f"Failed to write partial deps: {e}")
+        if deps_truncated:
+            err(f"  Partial deps stopped at the "
+                f"{_PARTIAL_CAP / (1024**3):.0f} GB cap: {deps_written:,} of "
                 f"{len(deps):,} entries")
 
         suspects_found = {}
@@ -476,21 +686,22 @@ def main(input_path=None):
             "lines_total_estimate": total_estimate,
             "pct_processed": pct,
             "declarations_found": len(decls),
-            "deps_entries": len(deps_to_write),
+            "deps_file": os.path.basename(deps_path),
+            "deps_entries": deps_written,
             "deps_total": len(deps),
+            "deps_truncated": deps_truncated,
+            "mdata_seen": mdata_seen,
+            "mdata_skipped": mdata_skipped,
             "elapsed_s": round(time.monotonic() - t0, 1),
-            "rss_at_exit_bytes": resource.getrusage(
-                resource.RUSAGE_SELF).ru_maxrss,
+            "footprint_at_exit_bytes": _get_footprint(),
             "suspects_in_partial_deps": suspects_found,
-            "deps": {name: sorted(refs)
-                     for name, refs in deps_to_write.items()},
         }
 
         try:
             with open(partial_path, "w") as f:
                 json.dump(partial, f, indent=2)
-            err(f"Wrote partial results ({len(deps_to_write):,} decls, "
-                f"{pct}%) to {partial_path}")
+            err(f"Wrote partial results ({deps_written:,} decls, "
+                f"{pct}%) to {partial_path} and {deps_path}")
         except Exception as e:
             err(f"Failed to write partial results: {e}")
 
@@ -512,6 +723,8 @@ def main(input_path=None):
             "exit_reason": exit_reason,
             "final_line": line_num,
             "final_decls": len(decls),
+            "mdata_seen": mdata_seen,
+            "mdata_skipped": mdata_skipped,
             "final_elapsed_s": round(time.monotonic() - t0, 1),
             "checkpoints": diag_checkpoints,
         }
@@ -561,10 +774,14 @@ def main(input_path=None):
 
         if "in" in obj:
             idx = obj["in"]
+            # sys.intern: components like "GlobalTheory" repeat millions
+            # of times; keep one copy of each string.
             if "str" in obj:
-                name_parts[idx] = (obj["str"]["pre"], obj["str"]["str"])
+                name_parts[idx] = (obj["str"]["pre"],
+                                   sys.intern(obj["str"]["str"]))
             elif "num" in obj:
-                name_parts[idx] = (obj["num"]["pre"], str(obj["num"]["i"]))
+                name_parts[idx] = (obj["num"]["pre"],
+                                   sys.intern(str(obj["num"]["i"])))
 
         elif "ie" in obj:
             idx = obj["ie"]
@@ -577,12 +794,24 @@ def main(input_path=None):
                 else:
                     children = list(dict.fromkeys(
                         _expr_child_idxs(obj)))
+                    if "mdata" in obj:
+                        mdata_seen += 1
+                        if not children:
+                            mdata_skipped += 1
                     if should_store(idx) and children:
+                        # `a | b` always allocates a new frozenset. When
+                        # one side already contains the other, share it.
                         merged = EMPTY
                         for ci in children:
-                            merged = merged | get_and_release(ci)
+                            r = get_and_release(ci)
+                            if not r or r is merged:
+                                continue
+                            if not merged or merged <= r:
+                                merged = r
+                            elif not r <= merged:
+                                merged = merged | r
                         if merged:
-                            const_refs[idx] = intern_set(merged)
+                            const_refs[idx] = merged
                     elif children:
                         for ci in children:
                             _decref(ci)
@@ -612,6 +841,14 @@ def main(input_path=None):
                 elif "proj" in obj:
                     const_refs[idx] = intern_set(
                         get_refs(obj["proj"]["struct"]))
+                elif "mdata" in obj:
+                    mdata_seen += 1
+                    kids = _expr_child_idxs(obj)
+                    if kids:
+                        const_refs[idx] = intern_set(get_refs(kids[0]))
+                    else:
+                        mdata_skipped += 1
+                        const_refs[idx] = EMPTY
                 else:
                     const_refs[idx] = EMPTY
 
@@ -640,7 +877,8 @@ def main(input_path=None):
                             ref_names.add(rname)
 
                     decls[name] = {"kind": kind, "line": line_num}
-                    deps[name] = ref_names
+                    # tuple: ~8 B per name vs ~35 B in a set
+                    deps[name] = tuple(ref_names)
                     break
 
         if line_num % 1_000_000 == 0:
@@ -650,7 +888,7 @@ def main(input_path=None):
                 err(f"  {line_num/1e6:.0f}M lines ({pct:.1f}%), "
                     f"{len(decls):,} decls, "
                     f"{len(const_refs):,} live / {diag_freed:,} freed, "
-                    f"{len(intern_cache):,} unique ref sets, {elapsed:.0f}s")
+                    f"{elapsed:.0f}s")
             else:
                 err(f"  {line_num/1e6:.0f}M lines, {len(decls):,} decls, "
                     f"{len(const_refs):,} exprs, "
@@ -658,15 +896,25 @@ def main(input_path=None):
 
             is_heavy = (line_num
                         % (_DIAG_HEAVY_INTERVAL * 1_000_000) == 0)
-            current_rss = diag_checkpoint(is_heavy)
+            current_rss, current_swap = diag_checkpoint(is_heavy)
 
+            stop_reason = None
             if current_rss >= MEMORY_CEILING:
-                err(f"DIAGNOSTIC: RSS {current_rss/(1024**2):.0f}MB "
+                err(f"DIAGNOSTIC: footprint {current_rss/(1024**2):.0f}MB "
                     f">= ceiling "
                     f"{MEMORY_CEILING/(1024**2):.0f}MB "
                     f"({_DIAG_CEILING_PCT}%)")
-                dump_partial("memory_ceiling")
-                write_diagnostics("memory_ceiling")
+                stop_reason = "memory_ceiling"
+            elif (swap_baseline is not None and current_swap is not None
+                    and current_swap - swap_baseline > _SWAP_GROWTH_LIMIT):
+                err(f"DIAGNOSTIC: swap grew "
+                    f"{(current_swap - swap_baseline)/(1024**3):.2f} GB "
+                    f"since start (limit "
+                    f"{_SWAP_GROWTH_LIMIT/(1024**3):.1f} GB)")
+                stop_reason = "swap_growth"
+            if stop_reason:
+                dump_partial(stop_reason)
+                write_diagnostics(stop_reason)
                 try:
                     if _stream_proc is not None:
                         _stream.close()
@@ -677,7 +925,7 @@ def main(input_path=None):
                     milestone_fh.close()
                 except Exception:
                     pass
-                sys.exit(0)
+                sys.exit(_GUARD_EXIT_CODE)
 
     # --- Close input stream ---
     if _stream_proc is not None:
@@ -691,15 +939,22 @@ def main(input_path=None):
             f"{diag_freed:,} freed / {len(const_refs):,} still live, "
             f"{len(name_parts):,} names, "
             f"{len(intern_cache):,} unique ref sets")
-        stale = sum(1 for c in ref_counts if 0 < c < 255)
+        saturated = ref_counts.count(_SAT)
+        stale = len(ref_counts) - ref_counts.count(0) - saturated
         if stale:
             err(f"WARNING: {stale} expressions with non-zero ref counts "
                 f"after parsing")
+        err(f"{saturated:,} expressions saturated at {_SAT} (never freed)")
     else:
         err(f"Parsed {line_num:,} lines in {elapsed:.1f}s: "
             f"{len(decls):,} declarations, {len(const_refs):,} expressions, "
             f"{len(name_parts):,} names, "
             f"{len(intern_cache):,} unique ref sets")
+    err(f"mdata expressions: {mdata_seen:,} seen, {mdata_skipped:,} "
+        f"skipped (no int 'expr' child)")
+    if mdata_skipped:
+        err(f"WARNING: {mdata_skipped:,} mdata expressions skipped; "
+            f"constants under them are missing from the cones")
 
     del const_refs
     del intern_cache
@@ -801,6 +1056,8 @@ def main(input_path=None):
         "permitted_axioms": config["permitted_axioms"],
         "suspect_names": config.get("suspect_names", []),
         "total_declarations": len(decls),
+        "mdata_seen": mdata_seen,
+        "mdata_skipped": mdata_skipped,
         "total_in_cone": len(all_in_cone),
         "axioms_in_cone": sorted(axioms_in_cone),
         "unexpected_axioms": sorted(unexpected),

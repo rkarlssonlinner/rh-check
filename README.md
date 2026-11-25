@@ -17,7 +17,7 @@ Andrew Sutherland's independent sandboxed rebuild at `math.mit.edu/~drew/grh/`. 
 
 ## Prerequisites
 
-- At least 8, but better 16 GB RAM (the cone mapper peaks at ~5.5 GB; other scripts are lighter)
+- At least 8 GB RAM for the exploit scan and vacuity check. The cone mapper's full-run peak is not yet measured; it stops itself before the machine swaps (see below).
 - Python 3.12+
 - `zstd` (command-line tool — `brew install zstd` on macOS, `apt install zstd` on Linux)
 - `curl`
@@ -70,11 +70,20 @@ Traces transitive declaration-level dependencies to check whether suspect defini
 
 ```sh
 rm -f results/cone/milestones.jsonl
-zstd -d --long=30 -c data/sutherland/solution.ndjson.zst 2>/dev/null \
-  | python3 -I scripts/cone_mapper.py
+CONE_GC_DISABLE=1 python3 -I scripts/cone_mapper.py data/sutherland/solution.ndjson.zst
 ```
 
-Environment variables: `CONE_GC_DISABLE=1` disables Python's cyclic GC (for comparison runs), `CONE_MEM_CEILING=80` sets the RSS ceiling as a percentage of physical RAM (default 80%). The script exits cleanly at the ceiling, dumping partial results to `results/cone/`.
+Pass the file path as shown. Piping into the script through stdin runs the old single-pass mode, which holds every expression in memory and does not fit the full export.
+
+Environment variables:
+
+- `CONE_GC_DISABLE=1` disables Python's cyclic GC. Recommended: in three logged runs the GC freed 0 objects and took about a quarter of the run time.
+- `CONE_MEM_CEILING=80` sets the memory ceiling as a percentage of physical RAM (default 80%). It measures the process's physical footprint (the number Activity Monitor shows), which includes compressed memory. Plain RSS does not, and stops growing once macOS starts compressing.
+- `CONE_SWAP_GROWTH_GB=2` stops the run if system swap grows by more than 2 GB after start (default 2). This catches memory pressure from other apps too.
+
+At either limit the script writes `results/cone/cone-partial.json` (summary and suspect hits) and `results/cone/cone-partial-deps.jsonl` (one declaration per line, capped at 5 GB), then exits with code 3.
+
+Pass 1 caches its counts in `results/cone/pass1-cache.bin` (about 2 GB). A later run on the same input skips pass 1. The mapper follows `mdata` wrappers and reports how many it had to skip (`mdata_skipped` in `cone-report.json`); a non-zero count means some constants are missing from the cones.
 
 ## What the scan covers
 
@@ -95,9 +104,9 @@ The scanner decompresses the export through a pipe (`zstd` into Python) and proc
 | Download | 7.7 GB | minimal | minimal | ~45 min (depends on connection) |
 | Exploit scan | no extra | 2–4 GB | 1 core | ~20 min with orjson, ~60 min without |
 | Vacuity check | no extra | 2–4 GB | 1 core | ~15 min with orjson |
-| Cone mapper | no extra | ~4–6 GB (two-pass mode) | 1 core + zstd | ~80 min |
+| Cone mapper | ~2 GB pass-1 cache (up to 5 GB more if stopped early) | not yet measured; stops at 80% footprint or on swap growth | 1 core + zstd | not yet measured (pass 1 ~20 min) |
 
-The cone mapper runs in two passes over the compressed export. Pass 1 counts how many times each expression will be referenced later, storing the counts in a compact array (~1 GB). Pass 2 builds the dependency cones and deletes each expression's data the moment nothing else needs it. Without this, data for all ~1 billion expressions stays in memory (~8 GB); with it, the live set stays at a few million entries (~4 GB total RSS).
+The cone mapper runs in two passes over the compressed export. Pass 1 counts how many times each expression will be referenced later, storing the counts in a compact array (2 bytes per expression, ~2 GB). Pass 2 builds the dependency cones and deletes each expression's data the moment nothing else needs it. Expressions referenced 65,535 times or more stay in memory for the whole run. When one sub-expression's set of constants already contains the other's, pass 2 reuses that set instead of copying it. An earlier version reached 9 million live entries by 15% of the export and was still growing; the full-run peak with the current code is not yet measured.
 
 All scans are single-threaded and stream-based. They can run in parallel if you have 8+ GB of free RAM, or sequentially on a machine with less. The `--chunk-next` mode lets you download and scan in smaller pieces (e.g., 250 MB at a time) if you want to inspect intermediate results, but each chunk re-decompresses from the start, so downloading everything at once is faster overall.
 
