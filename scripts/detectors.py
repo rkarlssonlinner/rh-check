@@ -241,6 +241,14 @@ if __name__ == "__main__":
                     help="Path to checkpoint file (line number to resume from)")
     args = ap.parse_args()
 
+    print("detectors — anomaly scanner for Lean 4 kernel exports (D1–D11)",
+          file=sys.stderr)
+    print(f"  output: {args.output}", file=sys.stderr)
+    if args.checkpoint:
+        print(f"  checkpoint: {args.checkpoint}", file=sys.stderr)
+    print(f"  mode: stdin", file=sys.stderr)
+    print("", file=sys.stderr)
+
     skip_to_line = 0
     prev_flags_file = None
     if args.checkpoint and os.path.exists(args.checkpoint):

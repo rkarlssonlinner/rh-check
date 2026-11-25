@@ -1,13 +1,18 @@
 """
 Build the dependency cone of the five main theorems.
 
-Single streaming pass: parse all lines, bubble up const references per expression,
-record declaration-to-declaration dependencies, then walk backward from theorem names.
+Two-pass mode (recommended for the full export, ~5.5 GB RSS):
+  Pass 1 — lightweight scan to count per-expression references.
+  Pass 2 — parse, compute deps, free each expression when its last reader is done.
 
-Memory: ~1-2 GB on the full export (interned frozensets of int IDs, not full JSON).
+Single-pass mode works exactly as before for stdin / small files.
 No recursion.
 
 Usage:
+  # Two-pass (recommended for full export):
+  .venv/bin/python3 -I scripts/cone_mapper.py data/sutherland/solution.ndjson.zst
+
+  # Single-pass stdin:
   cat data/sutherland/solution-first-10k.ndjson | .venv/bin/python3 -I scripts/cone_mapper.py
   zstd -d --long=30 -c data/sutherland/solution.ndjson.zst | .venv/bin/python3 -I scripts/cone_mapper.py
 
@@ -19,6 +24,7 @@ import sys
 import os
 import json
 import collections
+import itertools
 import time
 import gc
 import resource
@@ -79,6 +85,96 @@ def _gc_callback(phase, info):
 gc.callbacks.append(_gc_callback)
 
 
+# --- Two-pass helpers ---
+
+def _expr_child_idxs(obj):
+    """Sub-expression indices that an 'ie' object reads via get_refs."""
+    if "app" in obj:
+        a = obj["app"]
+        return [a["fn"], a["arg"]]
+    if "lam" in obj:
+        la = obj["lam"]
+        return [la["type"], la["body"]]
+    if "forallE" in obj:
+        fa = obj["forallE"]
+        return [fa["type"], fa["body"]]
+    if "letE" in obj:
+        le = obj["letE"]
+        return [le["type"], le["value"], le["body"]]
+    if "proj" in obj:
+        return [obj["proj"]["struct"]]
+    return []
+
+
+def _open_ndjson_stream(path):
+    """Open an NDJSON file (.zst or plain) for byte-level line iteration."""
+    if path.endswith(".zst"):
+        proc = subprocess.Popen(
+            ["zstd", "-d", "--long=30", "-c", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.stdout, proc
+    else:
+        return open(path, "rb"), None
+
+
+def _pass1_ref_counts(path, err):
+    """Pass 1: count how many times each expression index is referenced."""
+    err(f"Pass 1: counting references in {path}")
+    ref_counts = bytearray()
+    stream, proc = _open_ndjson_stream(path)
+    line_num = 0
+    t0 = time.monotonic()
+
+    def _grow(needed_idx):
+        gap = needed_idx + 1 - len(ref_counts)
+        if gap > 0:
+            ref_counts.extend(bytes(gap))
+
+    def _inc(idx):
+        if ref_counts[idx] < 255:
+            ref_counts[idx] += 1
+
+    try:
+        for raw in stream:
+            line_num += 1
+            obj = loads(raw)
+
+            if "ie" in obj:
+                idx = obj["ie"]
+                _grow(idx)
+                for si in dict.fromkeys(_expr_child_idxs(obj)):
+                    _grow(si)
+                    _inc(si)
+            else:
+                for kind in ("def", "thm", "inductive", "quot", "axiom",
+                             "opaque"):
+                    if kind in obj:
+                        for eid in dict.fromkeys(
+                                _decl_expr_ids(obj[kind])):
+                            _grow(eid)
+                            _inc(eid)
+                        break
+
+            if line_num % 10_000_000 == 0:
+                elapsed = time.monotonic() - t0
+                err(f"  Pass 1: {line_num/1e6:.0f}M lines, "
+                    f"{len(ref_counts):,} slots, "
+                    f"{len(ref_counts) / (1024**2):.0f} MB, "
+                    f"{elapsed:.0f}s")
+    finally:
+        stream.close()
+        if proc is not None:
+            proc.wait()
+
+    elapsed = time.monotonic() - t0
+    err(f"Pass 1 complete: {line_num:,} lines, "
+        f"{len(ref_counts):,} expression slots, "
+        f"{elapsed:.1f}s")
+    return ref_counts, line_num
+
+
 def load_config():
     path = os.path.join(PROJECT_DIR, "data", "sutherland", "comparator.json")
     with open(path) as f:
@@ -107,20 +203,36 @@ def resolve_name(idx, name_parts, cache):
     return cache[idx]
 
 
-def main():
+def main(input_path=None):
     config = load_config()
     theorem_names = set(config["theorem_names"])
     permitted_axioms = set(config["permitted_axioms"])
     suspect_names = set(config.get("suspect_names", []))
 
+    two_pass = input_path is not None
+
     name_parts = {}
     name_cache = {}
-    const_refs = []
     intern_cache = {EMPTY: EMPTY}
     decls = {}
     deps = {}
     line_num = 0
     t0 = time.monotonic()
+
+    if two_pass:
+        ref_counts, total_lines = _pass1_ref_counts(input_path, lambda m: print(
+            m, file=sys.stderr, flush=True))
+        const_refs = {}
+        diag_freed = 0
+        diag_live_hwm = 0
+    else:
+        ref_counts = None
+        const_refs = []
+        diag_freed = 0
+        diag_live_hwm = 0
+
+    _stream = None
+    _stream_proc = None
 
     # --- Diagnostic state ---
     diag_prev_rss = 0
@@ -137,6 +249,14 @@ def main():
     def err(msg):
         print(msg, file=sys.stderr, flush=True)
 
+    err("cone_mapper — dependency-cone scanner for Lean 4 kernel exports")
+    if two_pass:
+        err(f"  input: {input_path} ({total_lines:,} lines)")
+        err(f"  mode:  two-pass (memory-optimized)")
+    else:
+        err(f"  mode:  single-pass (stdin)")
+    err("")
+
     # --- GC toggle ---
     if _DIAG_GC_DISABLE:
         gc.disable()
@@ -145,6 +265,9 @@ def main():
         err(f"DIAGNOSTIC: GC enabled (thresholds: {gc.get_threshold()})")
     err(f"DIAGNOSTIC: physical RAM {PHYSICAL_RAM / (1024**3):.1f} GB, "
         f"ceiling {MEMORY_CEILING / (1024**3):.1f} GB ({_DIAG_CEILING_PCT}%)")
+    if two_pass:
+        err(f"Pass 2: processing with {len(ref_counts):,} ref-count slots "
+            f"({len(ref_counts) / (1024**2):.0f} MB)")
 
     def intern_set(s):
         fs = frozenset(s) if not isinstance(s, frozenset) else s
@@ -154,16 +277,56 @@ def main():
         intern_cache[fs] = fs
         return fs
 
-    def get_refs(idx):
-        if 0 <= idx < len(const_refs):
-            r = const_refs[idx]
-            if r is not None:
-                return r
-        return EMPTY
+    if two_pass:
+        def get_refs(idx):
+            return const_refs.get(idx, EMPTY)
 
-    def ensure_slot(idx):
-        while len(const_refs) <= idx:
-            const_refs.append(None)
+        def get_and_release(idx):
+            nonlocal diag_freed
+            val = const_refs.get(idx, EMPTY)
+            if idx < len(ref_counts):
+                c = ref_counts[idx]
+                if 0 < c < 255:
+                    c -= 1
+                    ref_counts[idx] = c
+                    if c == 0:
+                        if const_refs.pop(idx, None) is not None:
+                            diag_freed += 1
+            return val
+
+        def _decref(idx):
+            nonlocal diag_freed
+            if idx < len(ref_counts):
+                c = ref_counts[idx]
+                if 0 < c < 255:
+                    c -= 1
+                    ref_counts[idx] = c
+                    if c == 0:
+                        if const_refs.pop(idx, None) is not None:
+                            diag_freed += 1
+
+        def should_store(idx):
+            return idx < len(ref_counts) and ref_counts[idx] > 0
+
+    else:
+        def get_refs(idx):
+            if 0 <= idx < len(const_refs):
+                r = const_refs[idx]
+                if r is not None:
+                    return r
+            return EMPTY
+
+        get_and_release = get_refs
+
+        def _decref(idx):
+            pass
+
+        def should_store(idx):
+            return True
+
+        def ensure_slot(idx):
+            while len(const_refs) <= idx:
+                const_refs.append(None)
 
     # --- Diagnostic helpers ---
 
@@ -224,21 +387,33 @@ def main():
             "gc": _gc_snapshot(),
         }
 
-        if is_heavy and len(const_refs) > 0:
-            non_none = sum(1 for x in const_refs if x is not None)
-            record["const_refs_non_none"] = non_none
+        if two_pass:
+            record["const_refs_freed"] = diag_freed
+            record["const_refs_live_hwm"] = diag_live_hwm
+            record["ref_counts_len"] = len(ref_counts)
 
-            n_samples = min(1000, len(const_refs))
-            step = max(1, len(const_refs) // n_samples)
-            fs_sizes = []
-            for i in range(0, len(const_refs), step):
-                v = const_refs[i]
-                if v is not None:
-                    fs_sizes.append(sys.getsizeof(v))
+        if is_heavy and len(const_refs) > 0:
+            if two_pass:
+                non_none = len(const_refs)
+                record["const_refs_non_none"] = non_none
+                fs_sizes = [sys.getsizeof(v) for v in
+                            itertools.islice(const_refs.values(), 1000)]
+            else:
+                non_none = sum(1 for x in const_refs if x is not None)
+                record["const_refs_non_none"] = non_none
+                n_samples = min(1000, len(const_refs))
+                step = max(1, len(const_refs) // n_samples)
+                fs_sizes = []
+                for i in range(0, len(const_refs), step):
+                    v = const_refs[i]
+                    if v is not None:
+                        fs_sizes.append(sys.getsizeof(v))
+
             if fs_sizes:
                 avg_fs = sum(fs_sizes) / len(fs_sizes)
                 record["avg_frozenset_bytes"] = round(avg_fs, 1)
-                record["est_frozenset_total_bytes"] = int(avg_fs * non_none)
+                record["est_frozenset_total_bytes"] = int(
+                    avg_fs * non_none)
 
         if diag_prev_rss > 0 and diag_prev_line > 0:
             delta_rss = rss - diag_prev_rss
@@ -354,6 +529,12 @@ def main():
         dump_partial("sigterm")
         write_diagnostics("sigterm")
         try:
+            if _stream_proc is not None:
+                _stream.close()
+                _stream_proc.terminate()
+        except Exception:
+            pass
+        try:
             milestone_fh.close()
         except Exception:
             pass
@@ -361,13 +542,20 @@ def main():
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
+    # --- Open input stream ---
+
+    if two_pass:
+        _stream, _stream_proc = _open_ndjson_stream(input_path)
+    else:
+        _stream = sys.stdin
+
     # --- Main parsing loop ---
 
     err(f"Theorem targets: {sorted(theorem_names)}")
     err(f"Permitted axioms: {sorted(permitted_axioms)}")
     err("Parsing...")
 
-    for raw in sys.stdin:
+    for raw in _stream:
         line_num += 1
         obj = loads(raw)
 
@@ -380,32 +568,52 @@ def main():
 
         elif "ie" in obj:
             idx = obj["ie"]
-            ensure_slot(idx)
 
-            if "const" in obj:
-                const_refs[idx] = intern_set(frozenset({obj["const"]["name"]}))
-            elif "app" in obj:
-                a = obj["app"]
-                const_refs[idx] = intern_set(
-                    get_refs(a["fn"]) | get_refs(a["arg"]))
-            elif "lam" in obj:
-                la = obj["lam"]
-                const_refs[idx] = intern_set(
-                    get_refs(la["type"]) | get_refs(la["body"]))
-            elif "forallE" in obj:
-                fa = obj["forallE"]
-                const_refs[idx] = intern_set(
-                    get_refs(fa["type"]) | get_refs(fa["body"]))
-            elif "letE" in obj:
-                le = obj["letE"]
-                const_refs[idx] = intern_set(
-                    get_refs(le["type"]) | get_refs(le["value"])
-                    | get_refs(le["body"]))
-            elif "proj" in obj:
-                const_refs[idx] = intern_set(
-                    get_refs(obj["proj"]["struct"]))
+            if two_pass:
+                if "const" in obj:
+                    if should_store(idx):
+                        const_refs[idx] = intern_set(
+                            frozenset({obj["const"]["name"]}))
+                else:
+                    children = list(dict.fromkeys(
+                        _expr_child_idxs(obj)))
+                    if should_store(idx) and children:
+                        merged = EMPTY
+                        for ci in children:
+                            merged = merged | get_and_release(ci)
+                        if merged:
+                            const_refs[idx] = intern_set(merged)
+                    elif children:
+                        for ci in children:
+                            _decref(ci)
             else:
-                const_refs[idx] = EMPTY
+                ensure_slot(idx)
+
+                if "const" in obj:
+                    const_refs[idx] = intern_set(
+                        frozenset({obj["const"]["name"]}))
+                elif "app" in obj:
+                    a = obj["app"]
+                    const_refs[idx] = intern_set(
+                        get_refs(a["fn"]) | get_refs(a["arg"]))
+                elif "lam" in obj:
+                    la = obj["lam"]
+                    const_refs[idx] = intern_set(
+                        get_refs(la["type"]) | get_refs(la["body"]))
+                elif "forallE" in obj:
+                    fa = obj["forallE"]
+                    const_refs[idx] = intern_set(
+                        get_refs(fa["type"]) | get_refs(fa["body"]))
+                elif "letE" in obj:
+                    le = obj["letE"]
+                    const_refs[idx] = intern_set(
+                        get_refs(le["type"]) | get_refs(le["value"])
+                        | get_refs(le["body"]))
+                elif "proj" in obj:
+                    const_refs[idx] = intern_set(
+                        get_refs(obj["proj"]["struct"]))
+                else:
+                    const_refs[idx] = EMPTY
 
         elif "meta" in obj:
             pass
@@ -422,8 +630,8 @@ def main():
                     name = resolve_name(name_idx, name_parts, name_cache)
 
                     all_refs = set()
-                    for eid in _decl_expr_ids(decl):
-                        all_refs |= get_refs(eid)
+                    for eid in dict.fromkeys(_decl_expr_ids(decl)):
+                        all_refs |= get_and_release(eid)
 
                     ref_names = set()
                     for nidx in all_refs:
@@ -437,9 +645,16 @@ def main():
 
         if line_num % 1_000_000 == 0:
             elapsed = time.monotonic() - t0
-            err(f"  {line_num/1e6:.0f}M lines, {len(decls):,} decls, "
-                f"{len(const_refs):,} exprs, "
-                f"{len(intern_cache):,} unique ref sets, {elapsed:.0f}s")
+            if two_pass:
+                pct = 100 * line_num / total_lines
+                err(f"  {line_num/1e6:.0f}M lines ({pct:.1f}%), "
+                    f"{len(decls):,} decls, "
+                    f"{len(const_refs):,} live / {diag_freed:,} freed, "
+                    f"{len(intern_cache):,} unique ref sets, {elapsed:.0f}s")
+            else:
+                err(f"  {line_num/1e6:.0f}M lines, {len(decls):,} decls, "
+                    f"{len(const_refs):,} exprs, "
+                    f"{len(intern_cache):,} unique ref sets, {elapsed:.0f}s")
 
             is_heavy = (line_num
                         % (_DIAG_HEAVY_INTERVAL * 1_000_000) == 0)
@@ -453,19 +668,43 @@ def main():
                 dump_partial("memory_ceiling")
                 write_diagnostics("memory_ceiling")
                 try:
+                    if _stream_proc is not None:
+                        _stream.close()
+                        _stream_proc.terminate()
+                except Exception:
+                    pass
+                try:
                     milestone_fh.close()
                 except Exception:
                     pass
                 sys.exit(0)
 
+    # --- Close input stream ---
+    if _stream_proc is not None:
+        _stream.close()
+        _stream_proc.wait()
+
     elapsed = time.monotonic() - t0
-    err(f"Parsed {line_num:,} lines in {elapsed:.1f}s: "
-        f"{len(decls):,} declarations, {len(const_refs):,} expressions, "
-        f"{len(name_parts):,} names, "
-        f"{len(intern_cache):,} unique ref sets")
+    if two_pass:
+        err(f"Parsed {line_num:,} lines in {elapsed:.1f}s: "
+            f"{len(decls):,} declarations, "
+            f"{diag_freed:,} freed / {len(const_refs):,} still live, "
+            f"{len(name_parts):,} names, "
+            f"{len(intern_cache):,} unique ref sets")
+        stale = sum(1 for c in ref_counts if 0 < c < 255)
+        if stale:
+            err(f"WARNING: {stale} expressions with non-zero ref counts "
+                f"after parsing")
+    else:
+        err(f"Parsed {line_num:,} lines in {elapsed:.1f}s: "
+            f"{len(decls):,} declarations, {len(const_refs):,} expressions, "
+            f"{len(name_parts):,} names, "
+            f"{len(intern_cache):,} unique ref sets")
 
     del const_refs
     del intern_cache
+    if two_pass:
+        del ref_counts
 
     err("Computing cones...")
     cones = {}
@@ -609,4 +848,7 @@ def _decl_expr_ids(decl):
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        main(input_path=sys.argv[1])
+    else:
+        main()

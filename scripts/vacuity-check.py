@@ -188,9 +188,12 @@ ap.add_argument("-o", "--output", default=None,
                 help="Write JSON results to this file instead of stdout")
 cli_args = ap.parse_args()
 
-log("vacuity-check: streaming NDJSON export...")
+log("vacuity-check — suspect-name reachability for Lean 4 kernel exports")
 log(f"  targets:  {', '.join(sorted(TARGETS))}")
 log(f"  suspects: {', '.join(sorted(SUSPECT_NAMES))}")
+if cli_args.output:
+    log(f"  output:   {cli_args.output}")
+log(f"  mode:     stdin")
 log("")
 
 start = time.time()

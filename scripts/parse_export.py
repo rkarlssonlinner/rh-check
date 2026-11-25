@@ -284,6 +284,13 @@ def main():
     if len(sys.argv) > 1:
         limit = int(sys.argv[1])
 
+    print("parse_export — streaming NDJSON parser for Lean 4 kernel exports",
+          file=sys.stderr)
+    if limit:
+        print(f"  limit: {limit:,} lines", file=sys.stderr)
+    print(f"  mode: stdin", file=sys.stderr)
+    print("", file=sys.stderr)
+
     start = time.time()
     decl_kinds = collections.Counter()
     errors = 0

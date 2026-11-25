@@ -19,6 +19,11 @@ TARGET_EXPR = frozenset({"proj", "natVal", "sort", "const"})
 
 
 
+print("filter-targets — keep only detector-relevant lines from Lean 4 kernel exports",
+      file=sys.stderr)
+print(f"  mode: stdin → stdout", file=sys.stderr)
+print("", file=sys.stderr)
+
 kept = 0
 dropped = 0
 errors = 0

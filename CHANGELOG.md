@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-25 — Two-pass memory optimization and intro banners
+
+**Cone mapper two-pass ref counting** — `const_refs` grew linearly to ~1B entries on the full export (~8 GB pointer array). Two-pass mode (file path argument) fixes this: Pass 1 counts references in a compact `bytearray` (~1.1 GB), Pass 2 uses a dict and frees entries at ref_count 0. Projected RSS: ~12 GB → ~5.5 GB.
+
+- New CLI: `python3 -I scripts/cone_mapper.py data/sutherland/solution.ndjson.zst` (two-pass, memory-optimized). Stdin pipe still works (single-pass, unchanged behavior).
+- New helpers: `_expr_child_idxs()`, `_open_ndjson_stream()`, `_pass1_ref_counts()`.
+- Pass 2 progress shows percentage of total lines.
+- Verified: both modes produce byte-identical `cone-report.json` on the 10K test file. Zero stale ref counts.
+
+**Intro banners** — all five scripts now print a title line and key parameters to stderr at startup: `cone_mapper.py`, `detectors.py`, `parse_export.py`, `vacuity-check.py`, `filter-targets.py`.
+
+**README** — updated Vigslist comparison table cell.
+
+**Files changed:** `scripts/cone_mapper.py` (two-pass rewrite), `scripts/detectors.py`, `scripts/parse_export.py`, `scripts/vacuity-check.py`, `scripts/filter-targets.py` (intro banners), `README.md` (one table cell).
+
 ## 2026-11-25 — Cone mapper memory diagnostics
 
 The cone mapper (`scripts/cone_mapper.py`) OOM-killed twice on the full 1.08B-line export (16 GB Mac):

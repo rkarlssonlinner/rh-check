@@ -147,7 +147,7 @@ Several independent audits of the same proof appeared in November 2026. They ans
 
 | | rh-check (this repo) | Sutherland (MIT) | Zeng | Vigslist |
 |---|---|---|---|---|
-| **What it checks** | Known exploit signatures + whether flagged definitions reach the main theorems | Full re-verification of the proof in a patched kernel | Declaration-level dependency graph of the full export | Source-level reading of the proof's mathematical argument |
+| **What it checks** | Known exploit signatures + whether flagged definitions reach the main theorems | Full re-verification of the proof in a patched kernel | Declaration-level dependency graph of the full export | Source-level reading + dependency graph tracing of the proof's mathematical argument |
 | **Requires Lean?** | No | Yes (patched v4.36.0, hours of compute) | No | No (reads source but does not compile) |
 | **Hardware** | Laptop, 8 GB RAM | Server, 128+ GB RAM | Unclear | Laptop |
 | **Input** | Compressed kernel export (7.7 GB download) | Full source + Mathlib | Kernel export | Source archive |
