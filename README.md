@@ -66,7 +66,7 @@ zstd -d --long=30 -c data/sutherland/solution.ndjson.zst 2>/dev/null \
 
 ### Cone mapper (transitive dependency analysis)
 
-Traces transitive declaration-level dependencies to check whether suspect definitions reach the main theorems through intermediate lemmas. Currently instrumented with memory diagnostics (the full export exceeds 16 GB RAM):
+Traces transitive declaration-level dependencies to check whether suspect definitions reach the main theorems through intermediate lemmas:
 
 ```sh
 rm -f results/cone/milestones.jsonl
