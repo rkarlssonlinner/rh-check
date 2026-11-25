@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-11-25 — Cone mapper memory diagnostics
+
+The cone mapper (`scripts/cone_mapper.py`) OOM-killed twice on the full 1.08B-line export (16 GB Mac):
+
+- Run 1 (list + intern_cache): reached 157M lines / 30M unique frozensets before kill.
+- Run 2 (dict, no interning): reached 60M lines — strictly worse.
+
+Reverted to the original list + intern_cache approach and added three diagnostic checks:
+
+1. **GC profiling** — `gc.callbacks` timing per generation, toggleable via `CONE_GC_DISABLE=1`.
+2. **Memory tracking** — two-tier milestones (light every 1M lines, heavy every 10M) with RSS, per-structure sizing, frozenset sampling, growth extrapolation, OOM prediction.
+3. **Graceful exit** — 80% RAM ceiling (`CONE_MEM_CEILING` env var) dumps partial `deps` + diagnostics before OOM killer. SIGTERM handler does the same.
+
+Output: `results/cone/milestones.jsonl` (crash-safe JSONL, 50 MB cap), `results/cone/cone-partial.json` (partial deps, 5 GB cap), `results/cone/diagnostics.json` (summary on clean exit).
+
+**Files changed:** `scripts/cone_mapper.py` (~130 lines added, original logic unchanged).
+
+**Next:** run baseline + GC-disabled comparison, then use diagnostics to design the memory fix.
+
 ## 2026-11-25 — Full scan and vacuity check
 
 Downloaded the full 7.7 GB compressed export, SHA-256 verified. Ran both the exploit scan and vacuity check on all 1,468,418 declarations.
@@ -27,7 +46,7 @@ Downloaded the full 7.7 GB compressed export, SHA-256 verified. Ran both the exp
 
 - D5 needs re-run after the name-matching fix.
 - Stage 2 positive controls not yet built (requires Lean).
-- Transitive dependency cone analysis for `anyGeometry` not yet completed.
+- Transitive dependency cone analysis for `anyGeometry` not yet completed (cone mapper OOM-kills; memory diagnostics added, fix in progress).
 
 ## 2026-11-24 — Project setup and infrastructure
 

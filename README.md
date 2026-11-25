@@ -63,6 +63,18 @@ zstd -d --long=30 -c data/sutherland/solution.ndjson.zst 2>/dev/null \
   | python3 -I scripts/vacuity-check.py
 ```
 
+### Cone mapper (transitive dependency analysis)
+
+Traces transitive declaration-level dependencies to check whether suspect definitions reach the main theorems through intermediate lemmas. Currently instrumented with memory diagnostics (the full export exceeds 16 GB RAM):
+
+```sh
+rm -f results/cone/milestones.jsonl
+zstd -d --long=30 -c data/sutherland/solution.ndjson.zst 2>/dev/null \
+  | python3 -I scripts/cone_mapper.py
+```
+
+Environment variables: `CONE_GC_DISABLE=1` disables Python's cyclic GC (for comparison runs), `CONE_MEM_CEILING=80` sets the RSS ceiling as a percentage of physical RAM (default 80%). The script exits cleanly at the ceiling, dumping partial results to `results/cone/`.
+
 ## What the scan covers
 
 16 known exploits (E01–E16) across 8 categories, detected by 11 detectors (D1–D11). See [results/stage1a/taxonomy.md](results/stage1a/taxonomy.md) for the full catalogue and coverage matrix.
@@ -82,6 +94,7 @@ The scanner decompresses the export through a pipe (`zstd` into Python) and proc
 | Download | 7.7 GB | minimal | minimal | ~45 min (depends on connection) |
 | Exploit scan | no extra | 2–4 GB | 1 core | ~20 min with orjson, ~60 min without |
 | Vacuity check | no extra | 2–4 GB | 1 core | ~15 min with orjson |
+| Cone mapper | no extra | exceeds 16 GB (partial run) | 1 core | ~19 min to ceiling |
 
 Both scans are single-threaded and stream-based. They can run in parallel if you have 8+ GB of free RAM, or sequentially on a machine with less. The `--chunk-next` mode lets you download and scan in smaller pieces (e.g., 250 MB at a time) if you want to inspect intermediate results, but each chunk re-decompresses from the start, so downloading everything at once is faster overall.
 
@@ -98,7 +111,7 @@ All network activity is `curl` GET requests to `math.mit.edu`. All processing is
 **Vacuity check:**
 
 - Traces direct constant references in the expression tree. If `anyGeometry` enters the proof through a chain of intermediate lemmas (A calls B calls C calls `anyGeometry`), this check reports NO for the main theorem even though the dependency exists indirectly.
-- To catch indirect dependencies, a full transitive dependency cone analysis is needed (the cone mapper in `scripts/cone_mapper.py` does this, but requires a complete scan).
+- To catch indirect dependencies, a full transitive dependency cone analysis is needed. The cone mapper (`scripts/cone_mapper.py`) does this but currently exceeds 16 GB RAM on the full export. It is instrumented with memory diagnostics; a fix is in progress.
 - This check answers "does the expression tree contain it?" — not "could the proof be restructured to avoid it?"
 
 **General:**
@@ -128,9 +141,27 @@ Claims on Twitter allege that `anyGeometry`, defined as `fun _ _ _ => True`, ren
 - Green: Sutherland's auxiliary data independently confirms `anyGeometry` is absent from the theorem types' transitive dependency cones.
 - Red: `anyGeometry` is defined as `fun _ _ _ => True` and exists in the export. Its role in intermediate lemmas has not been fully traced via transitive dependency analysis.
 
+## How this compares to other audits
+
+Several independent audits of the same proof appeared in November 2026. They answer different questions and require different resources.
+
+| | rh-check (this repo) | Sutherland (MIT) | Zeng | Vigslist |
+|---|---|---|---|---|
+| **What it checks** | Known exploit signatures + whether flagged definitions reach the main theorems | Full re-verification of the proof in a patched kernel | Declaration-level dependency graph of the full export | Source-level reading of the proof's mathematical argument |
+| **Requires Lean?** | No | Yes (patched v4.36.0, hours of compute) | No | No (reads source but does not compile) |
+| **Hardware** | Laptop, 8 GB RAM | Server, 128+ GB RAM | Unclear | Laptop |
+| **Input** | Compressed kernel export (7.7 GB download) | Full source + Mathlib | Kernel export | Source archive |
+| **Can check a new suspect name** | Yes, one-line config change | Requires new compilation | Requires full re-run | Requires manual reading |
+| **Can run on partial data** | Yes, streams and saves intermediate results | No | No | N/A |
+| **Catches kernel bugs** | Known families only | All (by re-running the kernel) | No | No |
+| **Catches vacuous definitions** | Yes (direct + transitive) | Indirectly (if the proof still compiles without them) | Yes (dependency graph) | Yes (by reading the code) |
+| **Catches semantic weakness** | No | No | No | Yes (reads what the proof actually argues) |
+
+Vigslist's audit (November 2026) is the deepest published analysis. It does not claim the formal derivation fails. It identifies eight points where the proof's names and packaging describe a different argument from what the code contains. Those are source-level observations this tool cannot make. See Vigslist, "An Audit of the Claimed Lean Proof of the Riemann Hypothesis: Eight Findings, with Addresses."
+
 **How robust is this?**
 
-This scan checks for known exploit families and direct expression-level references. It would not catch a novel kernel bug or an indirect vacuity that routes through many intermediate lemmas. The strongest external evidence remains Sutherland's independent re-verification on a fully patched Lean kernel (v4.36.0), which covers both known and unknown kernel bugs. Our scan is a complementary structural check, not a substitute.
+This scan checks for known exploit families and direct expression-level references. It would not catch a novel kernel bug or a semantic weakness like those in Vigslist's findings. The strongest external evidence remains Sutherland's independent re-verification on a fully patched Lean kernel (v4.36.0), which covers both known and unknown kernel bugs. Our scan is a complementary structural check, not a substitute.
 
 **How confident are we in the pipeline itself?**
 
