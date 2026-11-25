@@ -1,6 +1,6 @@
 # rh-check
 
-Read-only streaming scan of the Lean 4 kernel export of Alpöge's RH proof for known exploit families and vacuity claims. A complementary check that never compiles Lean and never needs the full 62 GB on disk.
+Read-only streaming scan of the Lean 4 kernel export of Alpöge's RH proof for known exploit families and vacuity claims. This is complementary check that never compiles Lean and never needs the full 62 GB on disk.
 
 ## What this does
 
