@@ -17,7 +17,7 @@ Andrew Sutherland's independent sandboxed rebuild at `math.mit.edu/~drew/grh/`. 
 
 ## Prerequisites
 
-- At least 16 GB RAM (the cone mapper peaks at ~5.5 GB; other scripts are lighter)
+- At least 8, but better 16 GB RAM (the cone mapper peaks at ~5.5 GB; other scripts are lighter)
 - Python 3.12+
 - `zstd` (command-line tool — `brew install zstd` on macOS, `apt install zstd` on Linux)
 - `curl`
